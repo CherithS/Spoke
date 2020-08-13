@@ -1,5 +1,6 @@
 import gql from "graphql-tag";
 
+// TODO: rename phoneNumbers to messagingServiceNumbers or something like that
 export const schema = gql`
   input CampaignsFilter {
     isArchived: Boolean
@@ -10,17 +11,36 @@ export const schema = gql`
     searchString: String
   }
 
+  type TexterUIConfig {
+    options: String
+    sideboxChoices: [String]
+  }
+
+  input TexterUIConfigInput {
+    options: String
+    sideboxChoices: [String]
+  }
+
+  type ErrorStat {
+    code: String!
+    count: Int!
+    link: String
+    description: String
+  }
+
   type CampaignStats {
     sentMessagesCount: Int
     receivedMessagesCount: Int
     optOutsCount: Int
+    errorCounts: [ErrorStat]
   }
 
   type CampaignCompletionStats {
-    contactsCount: Int
     assignedCount: Int
-    messagedCount: Int
+    contactsCount: Int
     errorCount: Int
+    messagedCount: Int
+    needsResponseCount: Int
   }
 
   type IngestMethod {
@@ -44,14 +64,28 @@ export const schema = gql`
     resultMessage: String
   }
 
+  type CampaignPhoneNumberCount {
+    areaCode: String!
+    count: Int!
+  }
+
+  input CampaignPhoneNumberInput {
+    areaCode: String!
+    count: Int!
+  }
+
   type Campaign {
     id: ID
     organization: Organization
     title: String
     description: String
+    joinToken: String
+    batchSize: Int
+    responseWindow: Float
     dueBy: Date
     isStarted: Boolean
     isArchived: Boolean
+    isArchivedPermanently: Boolean
     creator: User
     texters: [User]
     assignments(assignmentsFilter: AssignmentsFilter): [Assignment]
@@ -63,6 +97,7 @@ export const schema = gql`
     hasUnsentInitialMessages: Boolean
     customFields: [String]
     cannedResponses(userId: String): [CannedResponse]
+    texterUIConfig: TexterUIConfig
     stats: CampaignStats
     completionStats: CampaignCompletionStats
     pendingJobs: [JobRequest]
@@ -82,6 +117,7 @@ export const schema = gql`
     messageserviceSid: String
     useOwnMessagingService: Boolean
     phoneNumbers: [String]
+    inventoryPhoneNumberCounts: [CampaignPhoneNumberCount]
   }
 
   type CampaignsList {

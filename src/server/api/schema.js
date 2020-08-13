@@ -3,25 +3,17 @@ import GraphQLJSON from "graphql-type-json";
 import { GraphQLError } from "graphql/error";
 import isUrl from "is-url";
 
-import { log, gzip, makeTree, getHighestRole } from "../../lib";
+import { gzip, makeTree, getHighestRole } from "../../lib";
 import { capitalizeWord } from "./lib/utils";
 import twilio from "./lib/twilio";
+import ownedPhoneNumber from "./lib/owned-phone-number";
 
+import { getIngestMethod } from "../../extensions/contact-loaders";
 import {
-  assignTexters,
-  dispatchContactIngestLoad,
-  exportCampaign,
-  importScript,
-  loadCampaignCache
-} from "../../workers/jobs";
-import { getIngestMethod } from "../../integrations/contact-loaders";
-import {
-  Assignment,
   Campaign,
   CannedResponse,
   InteractionStep,
   Invite,
-  JobRequest,
   Message,
   Organization,
   Tag,
@@ -29,34 +21,32 @@ import {
   r,
   cacheableData
 } from "../models";
-import { Notifications, sendUserNotification } from "../notifications";
 import { resolvers as assignmentResolvers } from "./assignment";
 import { getCampaigns, resolvers as campaignResolvers } from "./campaign";
 import { resolvers as campaignContactResolvers } from "./campaign-contact";
 import { resolvers as cannedResponseResolvers } from "./canned-response";
 import {
   getConversations,
-  getCampaignIdMessageIdsAndCampaignIdContactIdsMaps,
+  getCampaignIdContactIdsMaps,
   reassignConversations,
   resolvers as conversationsResolver
 } from "./conversations";
 import {
   accessRequired,
   assignmentRequiredOrAdminRole,
-  assignmentRequired,
   authRequired
 } from "./errors";
 import { resolvers as interactionStepResolvers } from "./interaction-step";
 import { resolvers as inviteResolvers } from "./invite";
 import { saveNewIncomingMessage } from "./lib/message-sending";
-import { getConfig } from "./lib/config";
+import { getConfig, getFeatures } from "./lib/config";
 import { resolvers as messageResolvers } from "./message";
 import { resolvers as optOutResolvers } from "./opt-out";
 import { resolvers as organizationResolvers } from "./organization";
 import { GraphQLPhone } from "./phone";
 import { resolvers as questionResolvers } from "./question";
 import { resolvers as questionResponseResolvers } from "./question-response";
-import { getTags, resolvers as tagResolvers } from "./tag";
+import { resolvers as tagResolvers } from "./tag";
 import { getUsers, resolvers as userResolvers } from "./user";
 import { change } from "../local-auth-helpers";
 import { symmetricEncrypt } from "./lib/crypto";
@@ -66,17 +56,113 @@ import {
   bulkSendMessages,
   buyPhoneNumbers,
   findNewCampaignContact,
+  joinOrganization,
+  editOrganization,
+  releaseContacts,
   sendMessage,
-  updateQuestionResponses
+  startCampaign,
+  updateContactTags,
+  updateQuestionResponses,
+  releaseCampaignNumbers
 } from "./mutations";
 
-const ActionHandlers = require("../../integrations/action-handlers");
+const ActionHandlers = require("../../extensions/action-handlers");
+import { jobRunner } from "../../extensions/job-runners";
+import { Jobs } from "../../workers/job-processes";
+import { Tasks } from "../../workers/tasks";
 
 const uuidv4 = require("uuid").v4;
-const JOBS_SAME_PROCESS = !!(
-  process.env.JOBS_SAME_PROCESS || global.JOBS_SAME_PROCESS
-);
-const JOBS_SYNC = !!(process.env.JOBS_SYNC || global.JOBS_SYNC);
+
+// This function determines whether a field was requested
+// in a graphql query. Each graphql resolver receives a fourth parameter,
+// which contains information about the current request and the execution
+// context. It might be userful to determine this in order to avoid
+// retrieving fields through database joins if they were not
+// requested, for example.
+//
+// In the following query, let's say you want to test whether tags was
+// included. The path to tags is conversations/conversations/contact/tags,
+// because tags is in the contact object which is in the conversations
+// object which is in the conversations query.
+//
+// Therefore, assuming the fourth parameter to your resolver is called
+// 'graphqlInfo', the call to this function to determine if tags is in
+// that specific position would be:
+//   isFieldInSelectionSetHierarchy(graphqlInfo, ["conversations", "conversations", "contact", "tags"]);
+//
+// query Q(
+//   $organizationId: String!
+//   $cursor: OffsetLimitCursor!
+//   $contactsFilter: ContactsFilter
+//   $campaignsFilter: CampaignsFilter
+//   $assignmentsFilter: AssignmentsFilter
+//   $utc: String
+// ) {
+//   conversations(
+//     cursor: $cursor
+//     organizationId: $organizationId
+//     campaignsFilter: $campaignsFilter
+//     contactsFilter: $contactsFilter
+//     assignmentsFilter: $assignmentsFilter
+//     utc: $utc
+//   ) {
+//     pageInfo {
+//       limit
+//       offset
+//       total
+//     }
+//     conversations {
+//       texter {
+//         id
+//         displayName
+//       }
+//       contact {
+//         id
+//         assignmentId
+//         firstName
+//         lastName
+//         cell
+//         messageStatus
+//         messages {
+//           id
+//           text
+//           isFromContact
+//         }
+//         tags {
+//           id
+//         }
+//         optOut {
+//           id
+//         }
+//       }
+//       campaign {
+//         id
+//         title
+//       }
+//     }
+//   }
+// }
+const isFieldInSelectionSetHierarchy = (graphqlInfo, fieldPath) => {
+  const findField = (selectionSet, fieldName) => {
+    if (!selectionSet.selections) {
+      return undefined;
+    }
+
+    return selectionSet.selections.find(
+      ss =>
+        ss.kind === "Field" &&
+        ss.name.kind === "Name" &&
+        ss.name.value === fieldName
+    );
+  };
+
+  let currentLevel = graphqlInfo.operation;
+
+  return fieldPath.every(field => {
+    currentLevel = findField(currentLevel.selectionSet, field);
+    return !!currentLevel;
+  });
+};
 
 async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
   const {
@@ -84,6 +170,8 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
     description,
     dueBy,
     useDynamicAssignment,
+    batchSize,
+    responseWindow,
     logoImageUrl,
     introHtml,
     primaryColor,
@@ -119,6 +207,8 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
     texting_hours_end: textingHoursEnd,
     use_own_messaging_service: useOwnMessagingService,
     messageservice_sid: messageserviceSid,
+    batch_size: batchSize,
+    response_window: responseWindow,
     timezone
   };
 
@@ -130,6 +220,17 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
   if (campaignUpdates.logo_image_url && !isUrl(logoImageUrl)) {
     campaignUpdates.logo_image_url = "";
   }
+  if (origCampaignRecord && !origCampaignRecord.join_token) {
+    campaignUpdates.join_token = uuidv4();
+  }
+  const features = getFeatures(origCampaignRecord);
+  if (campaign.texterUIConfig && campaign.texterUIConfig.options) {
+    Object.assign(features, {
+      TEXTER_UI_SETTINGS: campaign.texterUIConfig.options
+    });
+    campaignUpdates.features = JSON.stringify(features);
+  }
+
   let changed = Boolean(Object.keys(campaignUpdates).length);
   if (changed) {
     await r
@@ -147,11 +248,10 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
       user
     );
     if (ingestMethod) {
-      let job = await JobRequest.save({
+      await jobRunner.dispatchJob({
         queue_name: `${id}:edit_campaign`,
         job_type: `ingest.${campaign.ingestMethod}`,
         locks_queue: true,
-        assigned: JOBS_SAME_PROCESS, // can get called immediately, below
         campaign_id: id,
         payload: campaign.contactData
       });
@@ -163,12 +263,6 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
           ingest_method: campaign.ingestMethod,
           ingest_success: null
         });
-
-      if (JOBS_SAME_PROCESS) {
-        dispatchContactIngestLoad(job, organization, {
-          /*FUTURE: context obj*/
-        });
-      }
     } else {
       console.error("ingestMethod unavailable", campaign.ingestMethod);
     }
@@ -176,25 +270,16 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
 
   if (campaign.hasOwnProperty("texters")) {
     changed = true;
-    let job = await JobRequest.save({
+    await jobRunner.dispatchJob({
       queue_name: `${id}:edit_campaign`,
       locks_queue: true,
-      assigned: JOBS_SAME_PROCESS, // can get called immediately, below
-      job_type: "assign_texters",
+      job_type: Jobs.ASSIGN_TEXTERS,
       campaign_id: id,
       payload: JSON.stringify({
         id,
         texters: campaign.texters
       })
     });
-
-    if (JOBS_SAME_PROCESS) {
-      if (JOBS_SYNC) {
-        await assignTexters(job);
-      } else {
-        assignTexters(job);
-      }
-    }
   }
 
   if (campaign.hasOwnProperty("interactionSteps")) {
@@ -238,12 +323,38 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
     });
   }
 
+  if (campaign.hasOwnProperty("inventoryPhoneNumberCounts")) {
+    if (origCampaignRecord.isStarted) {
+      throw new Error(
+        "Cannot update phone numbers once a campaign has started"
+      );
+    }
+    const phoneCounts = campaign.inventoryPhoneNumberCounts;
+    await r.knex.transaction(async trx => {
+      await ownedPhoneNumber.releaseCampaignNumbers(id, trx);
+      for (const pc of phoneCounts) {
+        if (pc.count) {
+          await ownedPhoneNumber.allocateCampaignNumbers(
+            {
+              organizationId: organizationId,
+              campaignId: id,
+              areaCode: pc.areaCode,
+              amount: pc.count
+            },
+            trx
+          );
+        }
+      }
+    });
+  }
+
   const campaignRefreshed = await cacheableData.campaign.load(id, {
     forceLoad: changed
   });
 
   // hacky easter egg to force reload campaign contacts
   if (
+    r.redis &&
     campaignUpdates.description &&
     campaignUpdates.description.endsWith("..")
   ) {
@@ -253,7 +364,10 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
       campaignRefreshed,
       organization
     );
-    await loadCampaignCache(campaignRefreshed, organization, {});
+    await jobRunner.dispatchTask(Tasks.CAMPAIGN_START_CACHE, {
+      campaign: campaignRefreshed,
+      organization
+    });
   }
 
   return Campaign.get(id);
@@ -323,24 +437,30 @@ const rootMutations = {
   RootMutation: {
     bulkSendMessages,
     buyPhoneNumbers,
+    editOrganization,
     findNewCampaignContact,
+    joinOrganization,
+    releaseContacts,
     sendMessage,
-    userAgreeTerms: async (_, { userId }, { user, loaders }) => {
-      if (user.id === Number(userId)) {
-        return user.terms ? user : null;
-      }
-      const currentUser = await r
-        .table("user")
-        .get(userId)
+    startCampaign,
+    releaseCampaignNumbers,
+    userAgreeTerms: async (_, { userId }, { user }) => {
+      // We ignore userId: you can only agree to terms for yourself
+      await r
+        .knex("user")
+        .where("id", user.id)
         .update({
           terms: true
         });
       await cacheableData.user.clearUser(user.id, user.auth0_id);
-      return currentUser;
+      return {
+        ...user,
+        terms: true
+      };
     },
 
     sendReply: async (_, { id, message }, { user, loaders }) => {
-      const contact = await loaders.campaignContact.load(id);
+      const contact = await cacheableData.campaignContact.load(id);
       const campaign = await loaders.campaign.load(contact.campaign_id);
 
       await accessRequired(user, campaign.organization_id, "ADMIN");
@@ -379,32 +499,27 @@ const rootMutations = {
         }),
         contact
       );
-      return loaders.campaignContact.load(id);
+      return await cacheableData.campaignContact.load(id);
     },
     exportCampaign: async (_, { id }, { user, loaders }) => {
       const campaign = await loaders.campaign.load(id);
       const organizationId = campaign.organization_id;
       await accessRequired(user, organizationId, "ADMIN");
-      const newJob = await JobRequest.save({
+      return await jobRunner.dispatchJob({
         queue_name: `${id}:export`,
-        job_type: "export",
+        job_type: Jobs.EXPORT,
         locks_queue: false,
-        assigned: JOBS_SAME_PROCESS, // can get called immediately, below
         campaign_id: id,
         payload: JSON.stringify({
           id,
           requester: user.id
         })
       });
-      if (JOBS_SAME_PROCESS) {
-        exportCampaign(newJob);
-      }
-      return newJob;
     },
     editOrganizationRoles: async (
       _,
       { userId, organizationId, roles },
-      { user, loaders }
+      { user }
     ) => {
       const currentRoles = (
         await r
@@ -424,7 +539,7 @@ const rootMutations = {
 
       // Roles is sent as an array for historical purposes
       // but roles are hierarchical, so we only want one user_organization
-      // record.
+      // record. For legacy compatibility we still need to delete all recs for that user_id.
       await r
         .knex("user_organization")
         .where({ organization_id: organizationId, user_id: userId })
@@ -438,7 +553,7 @@ const rootMutations = {
         });
       }
       await cacheableData.user.clearUser(userId);
-      return loaders.organization.load(organizationId);
+      return { id: userId };
     },
     editUser: async (_, { organizationId, userId, userData }, { user }) => {
       if (user.id !== userId) {
@@ -457,7 +572,6 @@ const rootMutations = {
         return null;
       } else {
         const member = userRes[0];
-
         if (userData) {
           const newUserData = {
             first_name: capitalizeWord(userData.firstName).trim(),
@@ -468,12 +582,18 @@ const rootMutations = {
             email: userData.email,
             cell: userData.cell
           };
+          if (member.extra || userData.extra) {
+            newUserData.extra = {
+              ...member.extra,
+              ...JSON.parse(userData.extra || "{}")
+            };
+          }
 
           const userRes = await r
             .knex("user")
             .where("id", userId)
             .update(newUserData);
-          await cacheableData.user.clearUser(member.id, member.auth0_id);
+          await cacheableData.user.clearUser(member.user_id, member.auth0_id);
           userData = {
             id: userId,
             ...newUserData
@@ -518,89 +638,6 @@ const rootMutations = {
 
       return updatedUser;
     },
-    joinOrganization: async (
-      _,
-      { organizationUuid, queryParams },
-      { user, loaders }
-    ) => {
-      let organization;
-      [organization] = await r
-        .knex("organization")
-        .where("uuid", organizationUuid);
-      if (organization) {
-        const userOrg = await r
-          .table("user_organization")
-          .getAll(user.id, { index: "user_id" })
-          .filter({ organization_id: organization.id })
-          .limit(1)(0)
-          .default(null);
-        if (!userOrg) {
-          await UserOrganization.save({
-            user_id: user.id,
-            organization_id: organization.id,
-            role: "TEXTER"
-          }).error(function(error) {
-            // Unexpected errors
-            console.log("error on userOrganization save", error);
-          });
-          await cacheableData.user.clearUser(user.id);
-        } else {
-          // userOrg exists
-          console.log(
-            "existing userOrg " +
-              userOrg.id +
-              " user " +
-              user.id +
-              " organizationUuid " +
-              organizationUuid
-          );
-        }
-      } else {
-        // no organization
-        console.log(
-          "no organization with id " + organizationUuid + " for user " + user.id
-        );
-      }
-      return organization;
-    },
-    assignUserToCampaign: async (
-      _,
-      { organizationUuid, campaignId, queryParams },
-      { user, loaders }
-    ) => {
-      const campaign = await r
-        .knex("campaign")
-        .leftJoin("organization", "campaign.organization_id", "organization.id")
-        .where({
-          "campaign.id": campaignId,
-          "campaign.use_dynamic_assignment": true,
-          "organization.uuid": organizationUuid
-        })
-        .select("campaign.*")
-        .first();
-      if (!campaign) {
-        throw new GraphQLError({
-          status: 403,
-          message: "Invalid join request"
-        });
-      }
-      const assignment = await r
-        .table("assignment")
-        .getAll(user.id, { index: "user_id" })
-        .filter({ campaign_id: campaign.id })
-        .limit(1)(0)
-        .default(null);
-      if (!assignment) {
-        await Assignment.save({
-          user_id: user.id,
-          campaign_id: campaign.id,
-          max_contacts: process.env.MAX_CONTACTS_PER_TEXTER
-            ? parseInt(process.env.MAX_CONTACTS_PER_TEXTER, 10)
-            : null
-        });
-      }
-      return campaign;
-    },
     updateTextingHours: async (
       _,
       { organizationId, textingHoursStart, textingHoursEnd },
@@ -612,14 +649,13 @@ const rootMutations = {
         texting_hours_start: textingHoursStart,
         texting_hours_end: textingHoursEnd
       });
-      cacheableData.organization.clear(organizationId);
-
-      return await Organization.get(organizationId);
+      await cacheableData.organization.clear(organizationId);
+      return await cacheableData.organization.load(organizationId);
     },
     updateTextingHoursEnforcement: async (
       _,
       { organizationId, textingHoursEnforced },
-      { user, loaders }
+      { user }
     ) => {
       await accessRequired(user, organizationId, "SUPERVOLUNTEER");
 
@@ -628,7 +664,7 @@ const rootMutations = {
       });
       await cacheableData.organization.clear(organizationId);
 
-      return await loaders.organization.load(organizationId);
+      return await cacheableData.organization.load(organizationId);
     },
     updateOptOutMessage: async (
       _,
@@ -638,7 +674,7 @@ const rootMutations = {
       await accessRequired(user, organizationId, "OWNER");
 
       const organization = await Organization.get(organizationId);
-      const featuresJSON = JSON.parse(organization.features || "{}");
+      const featuresJSON = getFeatures(organization);
       featuresJSON.opt_out_message = optOutMessage;
       organization.features = JSON.stringify(featuresJSON);
 
@@ -660,7 +696,7 @@ const rootMutations = {
       await accessRequired(user, organizationId, "OWNER");
 
       const organization = await Organization.get(organizationId);
-      const featuresJSON = JSON.parse(organization.features || "{}");
+      const featuresJSON = getFeatures(organization);
       featuresJSON.TWILIO_ACCOUNT_SID = twilioAccountSid.substr(0, 64);
       featuresJSON.TWILIO_AUTH_TOKEN_ENCRYPTED = twilioAuthToken
         ? symmetricEncrypt(twilioAuthToken).substr(0, 256)
@@ -706,6 +742,11 @@ const rootMutations = {
         "ADMIN",
         /* allowSuperadmin=*/ true
       );
+
+      const organization = await loaders.organization.load(
+        campaign.organizationId
+      );
+
       const campaignInstance = new Campaign({
         organization_id: campaign.organizationId,
         creator_id: user.id,
@@ -714,6 +755,11 @@ const rootMutations = {
         due_by: campaign.dueBy,
         is_started: false,
         is_archived: false,
+        join_token: uuidv4(),
+        batch_size: Number(getConfig("DEFAULT_BATCHSIZE", organization) || 300),
+        response_window: getConfig("DEFAULT_RESPONSEWINDOW", organization, {
+          default: 48
+        }),
         use_own_messaging_service: false
       });
       const newCampaign = await campaignInstance.save();
@@ -722,9 +768,13 @@ const rootMutations = {
       });
       return editCampaign(newCampaign.id, campaign, loaders, user);
     },
-    copyCampaign: async (_, { id }, { user, loaders }) => {
-      const campaign = await loaders.campaign.load(id);
+    copyCampaign: async (_, { id }, { user }) => {
+      const campaign = await cacheableData.campaign.load(id);
       await accessRequired(user, campaign.organization_id, "ADMIN");
+
+      const organization = await cacheableData.organization.load(
+        campaign.organization_id
+      );
 
       const campaignInstance = new Campaign({
         organization_id: campaign.organization_id,
@@ -732,8 +782,15 @@ const rootMutations = {
         title: "COPY - " + campaign.title,
         description: campaign.description,
         due_by: campaign.dueBy,
+        batch_size:
+          campaign.batch_size ||
+          Number(getConfig("DEFAULT_BATCHSIZE", organization) || 300),
+        response_window:
+          campaign.response_window ||
+          Number(getConfig("DEFAULT_RESPONSEWINDOW", organization) || 48),
         is_started: false,
-        is_archived: false
+        is_archived: false,
+        join_token: uuidv4()
       });
       const newCampaign = await campaignInstance.save();
       await r.knex("campaign_admin").insert({
@@ -800,16 +857,20 @@ const rootMutations = {
 
       return newCampaign;
     },
-    unarchiveCampaign: async (_, { id }, { user, loaders }) => {
-      const campaign = await loaders.campaign.load(id);
+    unarchiveCampaign: async (_, { id }, { user }) => {
+      const campaign = await cacheableData.campaign.load(id);
       await accessRequired(user, campaign.organization_id, "ADMIN");
+      // TODO: make helper
+      if (campaignResolvers.Campaign.isArchivedPermanently(campaign)) {
+        throw new Error("Cannot archive permanently archived campaign");
+      }
       campaign.is_archived = false;
       await campaign.save();
       await cacheableData.campaign.clear(id);
       return campaign;
     },
-    archiveCampaign: async (_, { id }, { user, loaders }) => {
-      const campaign = await loaders.campaign.load(id);
+    archiveCampaign: async (_, { id }, { user }) => {
+      const campaign = await cacheableData.campaign.load(id);
       await accessRequired(user, campaign.organization_id, "ADMIN");
       campaign.is_archived = true;
       await campaign.save();
@@ -837,50 +898,8 @@ const rootMutations = {
           await cacheableData.campaign.clear(campaign.id);
         })
       );
+      loaders.campaign.clearAll();
       return campaigns;
-    },
-    startCampaign: async (
-      _,
-      { id },
-      { user, loaders, remainingMilliseconds }
-    ) => {
-      const campaign = await loaders.campaign.load(id);
-      await accessRequired(user, campaign.organization_id, "ADMIN");
-      const organization = await loaders.organization.load(
-        campaign.organization_id
-      );
-
-      if (campaign.use_own_messaging_service) {
-        if (campaign.messageservice_sid == undefined) {
-          const friendlyName = `Campaign: ${campaign.title} (${campaign.id}) [${process.env.BASE_URL}]`;
-          const messagingService = await twilio.createMessagingService(
-            organization,
-            friendlyName
-          );
-          campaign.messageservice_sid = messagingService.sid;
-        }
-      } else {
-        campaign.messageservice_sid = await cacheableData.organization.getMessageServiceSid(
-          organization
-        );
-      }
-
-      campaign.is_started = true;
-
-      await campaign.save();
-      const campaignRefreshed = await cacheableData.campaign.load(id, {
-        forceLoad: true
-      });
-      await sendUserNotification({
-        type: Notifications.CAMPAIGN_STARTED,
-        campaignId: id
-      });
-
-      // some asynchronous cache-priming:
-      await loadCampaignCache(campaignRefreshed, organization, {
-        remainingMilliseconds
-      });
-      return campaignRefreshed;
     },
     editCampaign: async (_, { id, campaign }, { user, loaders }) => {
       const origCampaign = await Campaign.get(id);
@@ -905,7 +924,7 @@ const rootMutations = {
       }
       return editCampaign(id, campaign, loaders, user, origCampaign);
     },
-    deleteJob: async (_, { campaignId, id }, { user, loaders }) => {
+    deleteJob: async (_, { campaignId, id }, { user }) => {
       const campaign = await Campaign.get(campaignId);
       await accessRequired(user, campaign.organization_id, "ADMIN");
       const res = await r
@@ -917,7 +936,7 @@ const rootMutations = {
         .delete();
       return { id };
     },
-    createCannedResponse: async (_, { cannedResponse }, { user, loaders }) => {
+    createCannedResponse: async (_, { cannedResponse }, { user }) => {
       authRequired(user);
 
       const cannedResponseInstance = new CannedResponse({
@@ -943,19 +962,15 @@ const rootMutations = {
         .andWhere({ user_id: cannedResponse.userId })
         .del();
       await query;
-      cacheableData.cannedResponse.clearQuery({
+      await cacheableData.cannedResponse.clearQuery({
         campaignId: cannedResponse.campaignId,
         userId: cannedResponse.userId
       });
       return cannedResponseInstance;
     },
-    createOrganization: async (
-      _,
-      { name, userId, inviteId },
-      { loaders, user }
-    ) => {
+    createOrganization: async (_, { name, userId, inviteId }, { user }) => {
       authRequired(user);
-      const invite = await loaders.invite.load(inviteId);
+      const invite = await Invite.get(inviteId);
       if (!invite || !invite.is_valid) {
         throw new GraphQLError({
           status: 400,
@@ -985,10 +1000,18 @@ const rootMutations = {
     editCampaignContactMessageStatus: async (
       _,
       { messageStatus, campaignContactId },
-      { loaders, user }
+      { user }
     ) => {
-      const contact = await loaders.campaignContact.load(campaignContactId);
-      await assignmentRequired(user, contact.assignment_id, null, contact);
+      const contact = await cacheableData.campaignContact.load(
+        campaignContactId
+      );
+      const organizationId = await cacheableData.campaignContact.orgId(contact);
+      await assignmentRequiredOrAdminRole(
+        user,
+        organizationId,
+        contact.assignment_id,
+        contact
+      );
       contact.message_status = messageStatus;
       await cacheableData.campaignContact.updateStatus(contact, messageStatus);
       return contact;
@@ -996,7 +1019,7 @@ const rootMutations = {
     getAssignmentContacts: async (
       _,
       { assignmentId, contactIds, findNew },
-      { loaders, user }
+      { user }
     ) => {
       if (contactIds.length === 0) {
         return [];
@@ -1004,57 +1027,58 @@ const rootMutations = {
       const firstContact = await cacheableData.campaignContact.load(
         contactIds[0]
       );
-      const campaign = await loaders.campaign.load(firstContact.campaign_id);
-      await assignmentRequiredOrAdminRole(
-        user,
-        campaign.organization_id,
-        assignmentId,
+      const organizationId = await cacheableData.campaignContact.orgId(
         firstContact
       );
-      let triedUpdate = false;
-      const contacts = contactIds.map(async (contactId, cIdx) => {
-        // note we are loading from cacheableData and NOT loaders to avoid loader staleness
-        // this is relevant for the possible multiple web dynos
-        let contact =
-          cIdx === 0
-            ? firstContact
-            : await cacheableData.campaignContact.load(contactId);
-
-        // If contact.assignment_id is null or misassigned,
-        // maybe the cache is stale so try refreshing.
-        if (
-          contact.cachedResult &&
-          Number(contact.assignment_id) !== Number(assignmentId) &&
-          !triedUpdate
-        ) {
-          // In case assignment_id from cache needs to be refreshed, try again
-          // user_id will only be a property if it's from a cached response
-          triedUpdate = true;
-          await cacheableData.campaignContact.updateCampaignAssignmentCache(
-            contact.campaign_id,
-            contactIds
-          );
-          contact = await cacheableData.campaignContact.load(contactId);
-        }
-
-        if (contact && Number(contact.assignment_id) === Number(assignmentId)) {
-          return contact;
-        }
-
-        return null;
-      });
-      if (findNew) {
-        // maybe FUTURE: we could automatically add dynamic assignments in the same api call
-        // findNewCampaignContact()
+      let effectiveAssignmentId = assignmentId;
+      if (!effectiveAssignmentId) {
+        effectiveAssignmentId = firstContact.assignment_id;
       }
-      return contacts;
+      await assignmentRequiredOrAdminRole(
+        user,
+        organizationId,
+        effectiveAssignmentId,
+        firstContact
+      );
+      const contacts = await Promise.all(
+        contactIds.map(
+          // FUTURE: consider a better path for no-caching to load all ids at the same time with loadMany
+          async (contactId, cIdx) =>
+            cIdx === 0
+              ? firstContact
+              : await cacheableData.campaignContact.load(contactId)
+        )
+      );
+      const hasAssn = contact =>
+        contact &&
+        Number(contact.assignment_id) === Number(effectiveAssignmentId)
+          ? contact
+          : null;
+      const retries = contacts.filter(c => c && !hasAssn(c) && c.cachedResult);
+      let updatedContacts = {};
+      if (retries.length) {
+        await cacheableData.campaignContact.updateCampaignAssignmentCache(
+          retries[0].campaign_id,
+          contactIds
+        );
+        const retriedContacts = await Promise.all(
+          retries.map(c => cacheableData.campaignContact.load(c.id))
+        );
+        retriedContacts.forEach(c => {
+          updatedContacts[c.id] = c;
+        });
+      }
+      console.log("getAssignedContacts", contacts.length, updatedContacts);
+      return contacts.map(c => c && (updatedContacts[c.id] || c)).map(hasAssn);
     },
     createOptOut: async (
       _,
-      { optOut, campaignContactId },
+      { optOut, campaignContactId, noReply },
       { loaders, user }
     ) => {
-      const contact = await loaders.campaignContact.load(campaignContactId);
+      const contact = await cacheableData.campaignContact.load(
+        campaignContactId
+      );
       const campaign = await loaders.campaign.load(contact.campaign_id);
 
       console.log(
@@ -1080,24 +1104,33 @@ const rootMutations = {
         campaignContactId,
         reason,
         assignmentId,
-        campaign
+        campaign,
+        noReply
       });
       console.log(
         "createOptOut post save",
         campaignContactId,
         contact.campaign_id
       );
-      loaders.campaignContact.clear(campaignContactId.toString());
+      await cacheableData.campaignContact.clear(campaignContactId.toString());
 
-      return loaders.campaignContact.load(campaignContactId);
+      return cacheableData.campaignContact.load(campaignContactId);
     },
     deleteQuestionResponses: async (
       _,
       { interactionStepIds, campaignContactId },
-      { loaders, user }
+      { user }
     ) => {
-      const contact = await loaders.campaignContact.load(campaignContactId);
-      await assignmentRequired(user, contact.assignment_id, null, contact);
+      const contact = await cacheableData.campaignContact.load(
+        campaignContactId
+      );
+      const organizationId = await cacheableData.campaignContact.orgId(contact);
+      await assignmentRequiredOrAdminRole(
+        user,
+        organizationId,
+        contact.assignment_id,
+        contact
+      );
       // TODO: maybe undo action_handler
       await r
         .knex("question_response")
@@ -1110,6 +1143,7 @@ const rootMutations = {
 
       return contact;
     },
+    updateContactTags,
     updateQuestionResponses,
     reassignCampaignContacts: async (
       _,
@@ -1122,30 +1156,18 @@ const rootMutations = {
       // group contactIds by campaign
       // group messages by campaign
       const campaignIdContactIdsMap = new Map();
-      const campaignIdMessagesIdsMap = new Map();
       for (const campaignIdContactId of campaignIdsContactIds) {
-        const {
-          campaignId,
-          campaignContactId,
-          messageIds
-        } = campaignIdContactId;
+        const { campaignId, campaignContactId } = campaignIdContactId;
 
         if (!campaignIdContactIdsMap.has(campaignId)) {
           campaignIdContactIdsMap.set(campaignId, []);
         }
 
         campaignIdContactIdsMap.get(campaignId).push(campaignContactId);
-
-        if (!campaignIdMessagesIdsMap.has(campaignId)) {
-          campaignIdMessagesIdsMap.set(campaignId, []);
-        }
-
-        campaignIdMessagesIdsMap.get(campaignId).push(...messageIds);
       }
 
       return await reassignConversations(
         campaignIdContactIdsMap,
-        campaignIdMessagesIdsMap,
         newTexterUserId
       );
     },
@@ -1153,33 +1175,33 @@ const rootMutations = {
       _,
       {
         organizationId,
+        newTexterUserId,
         campaignsFilter,
         assignmentsFilter,
         contactsFilter,
-        newTexterUserId
+        messageTextFilter
       },
       { user }
     ) => {
       // verify permissions
       await accessRequired(user, organizationId, "ADMIN", /* superadmin*/ true);
-      const {
-        campaignIdContactIdsMap,
-        campaignIdMessagesIdsMap
-      } = await getCampaignIdMessageIdsAndCampaignIdContactIdsMaps(
+      const { campaignIdContactIdsMap } = await getCampaignIdContactIdsMaps(
         organizationId,
-        campaignsFilter,
-        assignmentsFilter,
-        contactsFilter
+        {
+          campaignsFilter,
+          assignmentsFilter,
+          contactsFilter,
+          messageTextFilter
+        }
       );
 
       return await reassignConversations(
         campaignIdContactIdsMap,
-        campaignIdMessagesIdsMap,
         newTexterUserId
       );
     },
-    importCampaignScript: async (_, { campaignId, url }, { loaders, user }) => {
-      const campaign = await loaders.campaign.load(campaignId);
+    importCampaignScript: async (_, { campaignId, url }, { user }) => {
+      const campaign = await cacheableData.campaign.load(campaignId);
       await accessRequired(user, campaign.organization_id, "ADMIN", true);
       if (campaign.is_started || campaign.is_archived) {
         throw new GraphQLError(
@@ -1193,23 +1215,16 @@ const rootMutations = {
           url
         })
       );
-      const job = await JobRequest.save({
+      const job = await jobRunner.dispatchJob({
         queue_name: `${campaignId}:import_script`,
-        job_type: "import_script",
+        job_type: Jobs.IMPORT_SCRIPT,
         locks_queue: true,
-        assigned: JOBS_SAME_PROCESS, // can get called immediately, below
         campaign_id: campaignId,
         // NOTE: stringifying because compressedString is a binary buffer
         payload: compressedString.toString("base64")
       });
 
-      const jobId = job.id;
-
-      if (JOBS_SAME_PROCESS) {
-        importScript(job);
-      }
-
-      return jobId;
+      return job.id;
     },
     createTag: async (_, { organizationId, tagData }, { user }) => {
       await accessRequired(user, organizationId, "SUPERVOLUNTEER");
@@ -1262,13 +1277,27 @@ const rootResolvers = {
   },
   RootQuery: {
     campaign: async (_, { id }, { loaders, user }) => {
-      const campaign = await Campaign.get(id);
+      const campaign = await loaders.campaign.load(id);
       await accessRequired(user, campaign.organization_id, "SUPERVOLUNTEER");
       return campaign;
     },
-    assignment: async (_, { id }, { loaders, user }) => {
+    assignment: async (
+      _,
+      { assignmentId: assignmentIdInput, contactId },
+      { loaders, user }
+    ) => {
       authRequired(user);
-      const assignment = await loaders.assignment.load(id);
+      let assignmentId = assignmentIdInput;
+      if (contactId) {
+        const campaignContact = await cacheableData.campaignContact.load(
+          contactId
+        );
+        assignmentId = campaignContact.assignment_id;
+      }
+      const assignment = await loaders.assignment.load(assignmentId);
+      if (!assignment) {
+        return null;
+      }
       const campaign = await loaders.campaign.load(assignment.campaign_id);
       if (assignment.user_id == user.id) {
         await accessRequired(
@@ -1317,18 +1346,34 @@ const rootResolvers = {
         campaignsFilter,
         assignmentsFilter,
         contactsFilter,
+        messageTextFilter,
         utc
       },
-      { user }
+      { user },
+      graphqlInfo
     ) => {
+      // Determine if tags were requested in the graphql query.
+      // in order to avoid retrieving tags if they were not
+      // requested.
+      const includeTags = isFieldInSelectionSetHierarchy(graphqlInfo, [
+        "conversations",
+        "conversations",
+        "contact",
+        "tags"
+      ]);
+
       await accessRequired(user, organizationId, "SUPERVOLUNTEER", true);
       const data = await getConversations(
         cursor,
         organizationId,
-        campaignsFilter,
-        assignmentsFilter,
-        contactsFilter,
-        utc
+        {
+          campaignsFilter,
+          assignmentsFilter,
+          contactsFilter,
+          messageTextFilter
+        },
+        utc,
+        includeTags
       );
       return data;
     },
@@ -1364,15 +1409,15 @@ const rootResolvers = {
         filterBy
       );
     },
-    tags: async (_, { organizationId }, { user }) => {
-      await accessRequired(user, organizationId, "SUPERVOLUNTEER");
-      return getTags(organizationId);
-    },
     user: async (_, { organizationId, userId }, { user }) => {
-      if (user.id !== userId) {
+      // This is somewhat redundant to people and getCurrentUser above
+      if (user && !userId) {
+        return user;
+      } else if (user.id !== userId) {
         // User can view themselves
         await accessRequired(user, organizationId, "ADMIN", true);
       }
+      // TODO: use caching+loaders and possibly move into organization
       return r
         .knex("user")
         .join("user_organization", "user.id", "user_organization.user_id")
@@ -1380,6 +1425,11 @@ const rootResolvers = {
           "user_organization.organization_id": organizationId,
           "user.id": userId
         })
+        .select(
+          "user_organization.organization_id",
+          "user_organization.role",
+          "user.*"
+        )
         .first();
     }
   }

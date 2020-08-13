@@ -1,21 +1,21 @@
 import serviceMap from "../lib/services";
 import { accessRequired } from "../errors";
 import { getConfig } from "../lib/config";
-import { JobRequest } from "../../models";
-import { buyPhoneNumbers as buyNumbersJob } from "../../../workers/jobs";
-
-const JOBS_SAME_PROCESS = !!(
-  process.env.JOBS_SAME_PROCESS || global.JOBS_SAME_PROCESS
-);
+import { cacheableData } from "../../models";
+import { jobRunner } from "../../../extensions/job-runners";
+import { Jobs } from "../../../workers/job-processes";
 
 export const buyPhoneNumbers = async (
   _,
   { organizationId, areaCode, limit, addToOrganizationMessagingService },
-  { loaders, user }
+  { user }
 ) => {
   await accessRequired(user, organizationId, "OWNER");
-  const org = await loaders.organization.load(organizationId);
-  if (!getConfig("EXPERIMENTAL_PHONE_INVENTORY", org, { truthy: true })) {
+  const org = await cacheableData.organization.load(organizationId);
+  if (
+    !getConfig("EXPERIMENTAL_PHONE_INVENTORY", org, { truthy: true }) &&
+    !getConfig("PHONE_INVENTORY", org, { truthy: true })
+  ) {
     throw new Error("Phone inventory management is not enabled");
   }
   const serviceName = getConfig("DEFAULT_SERVICE", org);
@@ -36,20 +36,15 @@ export const buyPhoneNumbers = async (
     }
     messagingServiceSid = msgSrv;
   }
-  const job = await JobRequest.save({
+  return await jobRunner.dispatchJob({
     queue_name: `${organizationId}:buy_phone_numbers`,
     organization_id: organizationId,
-    job_type: "buy_phone_numbers",
+    job_type: Jobs.BUY_PHONE_NUMBERS,
     locks_queue: false,
-    assigned: JOBS_SAME_PROCESS,
     payload: JSON.stringify({
       areaCode,
       limit,
       messagingServiceSid
     })
   });
-  if (JOBS_SAME_PROCESS) {
-    buyNumbersJob(job);
-  }
-  return job;
 };

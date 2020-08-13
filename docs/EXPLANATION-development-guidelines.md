@@ -19,9 +19,9 @@ Generally, label by filename what kind of documentation it is in all-caps, one o
 * Reference
 
 ## Helpful Dev Tips
+
 * Run `sqlite3 mydb.sqlite` to connect to a SQL shell for the dev database
 * [Set up an ESLint plugin in your code editor so that you catch coding errors and follow code style guidelines more easily!](https://medium.com/planet-arkency/catch-mistakes-before-you-run-you-javascript-code-6e524c36f0c8#.oboqsse48)
-* [Install the redux-devtools-extension](https://github.com/zalmoxisus/redux-devtools-extension) in Chrome to get advanced Redux debugging features.
 
 ## Dependency Management
 
@@ -162,8 +162,7 @@ we want to add a value to campaign info for that edit page. We might need to edi
 * Helper functions are in [server/api/errors.js](https://github.com/MoveOnOrg/Spoke/blob/main/src/server/api/errors.js) which should/will be optimized to use cached info, etc.  Each of them will throw an error and therefore cancel the request if the user doesn't have the appropriate access.
   * `authRequired(user)` establishes that the user is not anonymous
   * `accessRequired(user, orgId, role, allowSuperadmin = false)` will require the user to have a certain role or higher.  Pass in `true` to allowSuperadmin if superadmins should be allowed.  Generally they should be allowed to do things, but might as well be explicit.
-  * `assignmentRequired(user, assignmentId)` makes sure that the user has the assignment in question
-  * `superAdminRequired(user)` requires a super-admin user
+  * `assignmentRequiredOrAdminRole(user, organizationId, assignmentId)` makes sure that the user has the assignment in question and is a TEXTER or is an ADMIN.  (optional arguments after assignmentId are `contact, assignment` which if already available in the context can speed checking -- those arguments should be loaded manually, and never passed from the client, of course.
 
 
 ## Asynchronous tasks (workers)

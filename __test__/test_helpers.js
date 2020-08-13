@@ -31,7 +31,7 @@ export function getContext(context) {
 
 export async function createUser(
   userInfo = {},
-  organization_id = null,
+  organizationId = null,
   role = null
 ) {
   const defaultUserInfo = {
@@ -46,10 +46,10 @@ export async function createUser(
     ...userInfo
   });
   await user.save();
-  if (organization_id && role) {
+  if (organizationId && role) {
     await r.knex("user_organization").insert({
       user_id: user.id,
-      organization_id,
+      organization_id: organizationId,
       role
     });
   }
@@ -128,7 +128,13 @@ export const updateUserRoles = async (
     userId,
     roles
   };
-  return await runGql(query, variables, adminUser);
+  const result = await runGql(query, variables, adminUser);
+  if (result && result.errors) {
+    throw new Exception(
+      "editOrganizationRoles failed " + JSON.stringify(result)
+    );
+  }
+  return result;
 };
 
 export async function createInvite() {
@@ -201,7 +207,17 @@ export async function setTwilioAuth(user, organization) {
     twilioMessageServiceSid: messageServiceSid
   };
 
-  return await graphql(mySchema, twilioQuery, rootValue, context, variables);
+  const result = await graphql(
+    mySchema,
+    twilioQuery,
+    rootValue,
+    context,
+    variables
+  );
+  if (result && result.errors) {
+    console.log("updateTwilioAuth failed " + JSON.stringify(result));
+  }
+  return result;
 }
 
 export async function createCampaign(
@@ -245,7 +261,8 @@ export async function saveCampaign(
   user,
   campaign,
   title = "test campaign",
-  useOwnMessagingService = "false"
+  useOwnMessagingService = "false",
+  inventoryPhoneNumberCounts = undefined
 ) {
   const rootValue = {};
   const description = "test description";
@@ -265,7 +282,8 @@ export async function saveCampaign(
       title,
       description,
       organizationId,
-      useOwnMessagingService
+      useOwnMessagingService,
+      inventoryPhoneNumberCounts
     },
     campaignId: campaign.id
   };
@@ -302,10 +320,11 @@ export async function createTexter(organization, userInfo = {}) {
     cell: "555-555-6666",
     email: "testtexter@example.com"
   };
-  const user = await createUser({
-    ...defaultUserInfo,
-    ...userInfo
-  });
+  const user = await createUser(
+    { ...defaultUserInfo, ...userInfo },
+    organization.data.createOrganization.id,
+    "TEXTER"
+  );
   if (user.errors) {
     throw new Exception("createUsers failed " + JSON.stringify(user));
   }
@@ -629,6 +648,7 @@ export const getConversations = async (
               texter {
                 id
                 displayName
+                roles(organizationId: $organizationId)
               }
               contact {
                 id

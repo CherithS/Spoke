@@ -1,6 +1,7 @@
 export const schema = `
   input AssignmentsFilter {
     texterId: Int
+    stats: Boolean
   }
   type Assignment {
     id: ID
@@ -8,6 +9,7 @@ export const schema = `
     campaign: Campaign
     contacts(contactsFilter: ContactsFilter): [CampaignContact]
     contactsCount(contactsFilter: ContactsFilter): Int
+    hasUnassignedContactsForTexter: Int
     userCannedResponses: [CannedResponse]
     campaignCannedResponses: [CannedResponse]
     maxContacts: Int

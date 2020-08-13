@@ -19,6 +19,7 @@ import _ from "lodash";
 // -1 - -MAX_SEND_ATTEMPTS (5): failed send messages
 // -100-....: custom local errors
 // -101: incoming message with a MediaUrl
+// -166: blocked send for profanity message_handler match
 
 const MAX_SEND_ATTEMPTS = 5;
 const MESSAGE_VALIDITY_PADDING_SECONDS = 30;
@@ -56,6 +57,27 @@ const headerValidator = () => {
 
     return Twilio.webhook(authToken, options)(req, res, next);
   };
+};
+
+export const errorDescriptions = {
+  12400: "Internal (Twilio) Failure",
+  21211: "Invalid 'To' Phone Number",
+  21602: "Message body is required",
+  21610: "Attempt to send to unsubscribed recipient",
+  21611: "Source number has exceeded max number of queued messages",
+  21612: "Unreachable via SMS or MMS",
+  21614: "Invalid mobile number",
+  30001: "Queue overflow",
+  30002: "Account suspended",
+  30003: "Unreachable destination handset",
+  30004: "Message blocked",
+  30005: "Unknown destination handset",
+  30006: "Landline or unreachable carrier",
+  30007: "Message Delivery - Carrier violation",
+  30008: "Message Delivery - Unknown error",
+  "-166":
+    "Internal: Message blocked due to text match trigger (profanity-tagger)",
+  "-167": "Internal: Initial message altered (initialtext-guard)"
 };
 
 async function convertMessagePartsToMessage(messageParts) {
@@ -105,11 +127,17 @@ async function getMessagingServiceSid(
   message,
   campaign
 ) {
+  // NOTE: because of this check you can't switch back to organization/global
+  // messaging service without breaking running campaigns.
   if (
     getConfig(
       "EXPERIMENTAL_TWILIO_PER_CAMPAIGN_MESSAGING_SERVICE",
-      organization
-    )
+      organization,
+      { truthy: true }
+    ) ||
+    getConfig("EXPERIMENTAL_CAMPAIGN_PHONE_NUMBERS", organization, {
+      truthy: true
+    })
   ) {
     const campaign =
       campaign || (await cacheableData.campaign.load(contact.campaign_id));
@@ -299,14 +327,12 @@ export function postMessageSend(
         .knex("campaign_contact")
         .where("id", message.campaign_contact_id)
         .update("error_code", changesToSave.error_code);
-    }
-
-    updateQuery = updateQuery.update(changesToSave);
-    if (trx) {
-      if (message.campaign_contact_id && changesToSave.error_code < 0) {
+      if (trx) {
         contactUpdateQuery = contactUpdateQuery.transacting(trx);
       }
     }
+
+    updateQuery = updateQuery.update(changesToSave);
 
     Promise.all([updateQuery, contactUpdateQuery]).then(() => {
       console.log("Saved message error status", changesToSave, err);
@@ -467,11 +493,19 @@ async function searchForAvailableNumbers(
   limit
 ) {
   const count = Math.min(limit, 30); // Twilio limit
-  return twilioInstance.availablePhoneNumbers(countryCode).local.list({
-    areaCode,
+  const criteria = {
     limit: count,
     capabilities: ["SMS", "MMS"]
-  });
+  };
+  let numberType = "local";
+  if (areaCode === "800") {
+    numberType = "tollFree";
+  } else {
+    criteria.areaCode = areaCode;
+  }
+  return twilioInstance
+    .availablePhoneNumbers(countryCode)
+    [numberType].list(criteria);
 }
 
 /**
@@ -587,6 +621,25 @@ async function buyNumbersInAreaCode(organization, areaCode, limit, opts = {}) {
   return totalPurchased;
 }
 
+async function addNumbersToMessagingService(
+  organization,
+  phoneSids,
+  messagingServiceSid
+) {
+  const twilioInstance = await getTwilio(organization);
+  return await bulkRequest(phoneSids, async phoneNumberSid =>
+    twilioInstance.messaging
+      .services(messagingServiceSid)
+      .phoneNumbers.create({ phoneNumberSid })
+  );
+}
+
+async function deleteMessagingService(organization, messagingServiceSid) {
+  const twilioInstance = await getTwilio(organization);
+  console.log("Deleting messaging service", messagingServiceSid);
+  return twilioInstance.messaging.services(messagingServiceSid).remove();
+}
+
 export default {
   syncMessagePartProcessing: !!process.env.JOBS_SAME_PROCESS,
   headerValidator,
@@ -597,5 +650,7 @@ export default {
   parseMessageText,
   createMessagingService,
   getPhoneNumbersForService,
-  buyNumbersInAreaCode
+  buyNumbersInAreaCode,
+  addNumbersToMessagingService,
+  deleteMessagingService
 };

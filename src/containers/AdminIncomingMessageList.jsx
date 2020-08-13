@@ -56,6 +56,20 @@ function getContactsFilterForConversationOptOutStatus(
 }
 
 export class AdminIncomingMessageList extends Component {
+  static tagsFilterStateFromTagsFilter = tagsFilter => {
+    let newTagsFilter = null;
+    if (tagsFilter.anyTag) {
+      newTagsFilter = ["*"];
+    } else if (tagsFilter.noTag) {
+      newTagsFilter = [];
+    } else if (!tagsFilter.ignoreTags) {
+      newTagsFilter = Object.values(tagsFilter.selectedTags).map(
+        tagFilter => tagFilter.id
+      );
+    }
+    return newTagsFilter;
+  };
+
   constructor(props) {
     super(props);
 
@@ -64,6 +78,7 @@ export class AdminIncomingMessageList extends Component {
       pageSize: 10,
       campaignsFilter: { isArchived: false },
       contactsFilter: { isOptedOut: false },
+      messageTextFilter: "",
       assignmentsFilter: {},
       needsRender: false,
       utc: Date.now().toString(),
@@ -75,7 +90,8 @@ export class AdminIncomingMessageList extends Component {
       includeActiveCampaigns: true,
       includeNotOptedOutConversations: true,
       includeOptedOutConversations: false,
-      clearSelectedMessages: false
+      clearSelectedMessages: false,
+      tagsFilter: { ignoreTags: true }
     };
   }
 
@@ -128,6 +144,13 @@ export class AdminIncomingMessageList extends Component {
     });
   };
 
+  handleMessageTextFilterChange = async messageTextFilter => {
+    await this.setState({
+      messageTextFilter,
+      needsRender: true
+    });
+  };
+
   handleMessageFilterChange = async messagesFilter => {
     const contactsFilter = Object.assign(
       _.omit(this.state.contactsFilter, ["messageStatus"]),
@@ -155,10 +178,11 @@ export class AdminIncomingMessageList extends Component {
   handleReassignAllMatchingRequested = async newTexterUserId => {
     await this.props.mutations.bulkReassignCampaignContacts(
       this.props.params.organizationId,
+      newTexterUserId,
       this.state.campaignsFilter || {},
       this.state.assignmentsFilter || {},
       this.state.contactsFilter || {},
-      newTexterUserId
+      this.state.messageTextFilter || null
     );
     this.setState({
       utc: Date.now().toString(),
@@ -288,6 +312,24 @@ export class AdminIncomingMessageList extends Component {
     });
   };
 
+  handleTagsFilterChanged = tagsFilter => {
+    const newTagsFilter = AdminIncomingMessageList.tagsFilterStateFromTagsFilter(
+      tagsFilter
+    );
+
+    const contactsFilter = {
+      ...this.state.contactsFilter,
+      tags: newTagsFilter || undefined
+    };
+
+    this.setState({
+      clearSelectedMessages: true,
+      contactsFilter,
+      tagsFilter,
+      needsRender: true
+    });
+  };
+
   conversationCountChanged = conversationCount => {
     this.setState({
       conversationCount
@@ -321,6 +363,7 @@ export class AdminIncomingMessageList extends Component {
             onUsersReceived={this.handleCampaignTextersReceived}
             pageSize={1000}
             campaignsFilter={this.state.campaignsFilter}
+            roleFilter="ANY"
           />
           <PaginatedCampaignsRetriever
             organizationId={this.props.params.organizationId}
@@ -334,6 +377,7 @@ export class AdminIncomingMessageList extends Component {
             onCampaignChanged={this.handleCampaignChanged}
             onTexterChanged={this.handleTexterChanged}
             onMessageFilterChanged={this.handleMessageFilterChange}
+            onMessageTextFilterChanged={this.handleMessageTextFilterChange}
             assignmentsFilter={this.state.assignmentsFilter}
             onActiveCampaignsToggled={this.handleActiveCampaignsToggled}
             onArchivedCampaignsToggled={this.handleArchivedCampaignsToggled}
@@ -351,6 +395,9 @@ export class AdminIncomingMessageList extends Component {
             includeOptedOutConversations={
               this.state.includeOptedOutConversations
             }
+            onTagsFilterChanged={this.handleTagsFilterChanged}
+            tagsFilter={this.state.tagsFilter}
+            tags={this.props.organization.organization.tags}
           />
           <br />
           <IncomingMessageActions
@@ -368,6 +415,7 @@ export class AdminIncomingMessageList extends Component {
             contactsFilter={this.state.contactsFilter}
             campaignsFilter={this.state.campaignsFilter}
             assignmentsFilter={this.state.assignmentsFilter}
+            messageTextFilter={this.state.messageTextFilter}
             utc={this.state.utc}
             onPageChanged={this.handlePageChange}
             onPageSizeChanged={this.handlePageSizeChange}
@@ -375,6 +423,7 @@ export class AdminIncomingMessageList extends Component {
             onConversationCountChanged={this.conversationCountChanged}
             clearSelectedMessages={this.state.clearSelectedMessages}
             onForceRefresh={this.handleForceRefresh}
+            tags={this.props.organization.organization.tags}
           />
         </div>
       </div>
@@ -385,17 +434,19 @@ export class AdminIncomingMessageList extends Component {
 export const bulkReassignCampaignContactsMutation = gql`
   mutation bulkReassignCampaignContacts(
     $organizationId: String!
+    $newTexterUserId: String!
     $contactsFilter: ContactsFilter
     $campaignsFilter: CampaignsFilter
     $assignmentsFilter: AssignmentsFilter
-    $newTexterUserId: String!
+    $messageTextFilter: String
   ) {
     bulkReassignCampaignContacts(
       organizationId: $organizationId
+      newTexterUserId: $newTexterUserId
       contactsFilter: $contactsFilter
       campaignsFilter: $campaignsFilter
       assignmentsFilter: $assignmentsFilter
-      newTexterUserId: $newTexterUserId
+      messageTextFilter: $messageTextFilter
     ) {
       campaignId
       assignmentId
@@ -424,7 +475,32 @@ AdminIncomingMessageList.propTypes = {
   conversations: PropTypes.object,
   mutations: PropTypes.object,
   params: PropTypes.object,
-  organization: PropTypes.object
+  organization: PropTypes.object,
+  tags: PropTypes.object
+};
+
+const queries = {
+  organization: {
+    query: gql`
+      query getOrganization($id: String!) {
+        organization(id: $id) {
+          id
+          tags {
+            id
+            name
+          }
+        }
+      }
+    `,
+    options: ownProps => {
+      return {
+        variables: {
+          id: ownProps.params.organizationId
+        },
+        fetchPolicy: "network-only"
+      };
+    }
+  }
 };
 
 const mutations = {
@@ -438,10 +514,11 @@ const mutations = {
   }),
   bulkReassignCampaignContacts: ownProps => (
     organizationId,
+    newTexterUserId,
     campaignsFilter,
     assignmentsFilter,
     contactsFilter,
-    newTexterUserId
+    messageTextFilter
   ) => ({
     mutation: bulkReassignCampaignContactsMutation,
     variables: {
@@ -449,11 +526,12 @@ const mutations = {
       campaignsFilter,
       assignmentsFilter,
       contactsFilter,
+      messageTextFilter,
       newTexterUserId
     }
   })
 };
 
-export const operations = { mutations };
+export const operations = { mutations, queries };
 
 export default loadData(operations)(withRouter(AdminIncomingMessageList));

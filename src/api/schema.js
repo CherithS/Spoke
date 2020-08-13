@@ -70,6 +70,9 @@ const rootSchema = gql`
     primaryColor: String
     introHtml: String
     useDynamicAssignment: Boolean
+    requestAfterReply: Boolean
+    batchSize: Int
+    responseWindow: Float
     ingestMethod: String
     contactData: String
     organizationId: String
@@ -83,7 +86,14 @@ const rootSchema = gql`
     textingHoursEnforced: Boolean
     textingHoursStart: Int
     textingHoursEnd: Int
+    texterUIConfig: TexterUIConfigInput
     timezone: String
+    inventoryPhoneNumberCounts: [CampaignPhoneNumberInput!]
+  }
+
+  input OrganizationInput {
+    texterUIConfig: TexterUIConfigInput
+    settings: OrgSettingsInput
   }
 
   input MessageInput {
@@ -109,6 +119,7 @@ const rootSchema = gql`
     cell: String!
     oldPassword: String
     newPassword: String
+    extra: String
   }
 
   input ContactMessage {
@@ -143,13 +154,15 @@ const rootSchema = gql`
     id: String
     name: String!
     group: String
-    description: String!
+    value: String
+    description: String
     isDeleted: Boolean
     organizationId: String
   }
 
   type FoundContact {
     found: Boolean
+    assignment: Assignment
   }
 
   type PageInfo {
@@ -184,6 +197,7 @@ const rootSchema = gql`
     ID_ASC
     ID_DESC
     TITLE
+    TIMEZONE
   }
 
   type RootQuery {
@@ -191,7 +205,7 @@ const rootSchema = gql`
     organization(id: String!, utc: String): Organization
     campaign(id: String!): Campaign
     inviteByHash(hash: String!): [Invite]
-    assignment(id: String!): Assignment
+    assignment(assignmentId: String, contactId: String): Assignment
     organizations: [Organization]
     conversations(
       cursor: OffsetLimitCursor!
@@ -199,6 +213,7 @@ const rootSchema = gql`
       campaignsFilter: CampaignsFilter
       assignmentsFilter: AssignmentsFilter
       contactsFilter: ContactsFilter
+      messageTextFilter: String
       utc: String
     ): PaginatedConversations
     campaigns(
@@ -216,14 +231,17 @@ const rootSchema = gql`
       filterString: String
       filterBy: FilterPeopleBy
     ): UsersReturn
-    tags(organizationId: String!): TagsList
-    user(organizationId: ID!, userId: ID!): User
+    user(organizationId: String!, userId: Int): User
   }
 
   type RootMutation {
     createInvite(invite: InviteInput!): Invite
     createCampaign(campaign: CampaignInput!): Campaign
     editCampaign(id: String!, campaign: CampaignInput!): Campaign
+    editOrganization(
+      id: String!
+      organization: OrganizationInput!
+    ): Organization
     deleteJob(campaignId: String!, id: String!): JobRequest
     copyCampaign(id: String!): Campaign
     exportCampaign(id: String!): JobRequest
@@ -235,6 +253,7 @@ const rootSchema = gql`
     ): Organization
     joinOrganization(
       organizationUuid: String!
+      campaignId: String
       queryParams: String
     ): Organization
     editOrganizationRoles(
@@ -242,7 +261,7 @@ const rootSchema = gql`
       userId: String!
       campaignId: String
       roles: [String]
-    ): Organization
+    ): User
     editUser(organizationId: String!, userId: Int!, userData: UserInput): User
     resetUserPassword(organizationId: String!, userId: Int!): String!
     changeUserPassword(userId: Int!, formData: UserPasswordChange): User
@@ -273,6 +292,7 @@ const rootSchema = gql`
     createOptOut(
       optOut: OptOutInput!
       campaignContactId: String!
+      noReply: Boolean
     ): CampaignContact
     editCampaignContactMessageStatus(
       messageStatus: String!
@@ -282,6 +302,7 @@ const rootSchema = gql`
       interactionStepIds: [String]
       campaignContactId: String!
     ): CampaignContact
+    updateContactTags(tags: [TagInput], campaignContactId: String!): String
     updateQuestionResponses(
       questionResponses: [QuestionResponseInput]
       campaignContactId: String!
@@ -292,7 +313,7 @@ const rootSchema = gql`
     unarchiveCampaign(id: String!): Campaign
     sendReply(id: String!, message: String!): CampaignContact
     getAssignmentContacts(
-      assignmentId: String!
+      assignmentId: String
       contactIds: [String]
       findNew: Boolean
     ): [CampaignContact]
@@ -300,11 +321,10 @@ const rootSchema = gql`
       assignmentId: String!
       numberContacts: Int!
     ): FoundContact
-    assignUserToCampaign(
-      organizationUuid: String!
-      campaignId: String!
-      queryParams: String
-    ): Campaign
+    releaseContacts(
+      assignmentId: String!
+      releaseConversations: Boolean
+    ): Assignment
     userAgreeTerms(userId: String!): User
     reassignCampaignContacts(
       organizationId: String!
@@ -316,6 +336,7 @@ const rootSchema = gql`
       campaignsFilter: CampaignsFilter
       assignmentsFilter: AssignmentsFilter
       contactsFilter: ContactsFilter
+      messageTextFilter: String
       newTexterUserId: String!
     ): [CampaignIdAssignmentId]
     importCampaignScript(campaignId: String!, url: String!): Int
@@ -328,6 +349,7 @@ const rootSchema = gql`
       limit: Int!
       addToOrganizationMessagingService: Boolean
     ): JobRequest
+    releaseCampaignNumbers(campaignId: ID!): Campaign!
   }
 
   schema {

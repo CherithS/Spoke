@@ -3,7 +3,9 @@ import React from "react";
 import RaisedButton from "material-ui/RaisedButton";
 import Chart from "../components/Chart";
 import { Card, CardTitle, CardText } from "material-ui/Card";
+import LinearProgress from "material-ui/LinearProgress";
 import TexterStats from "../components/TexterStats";
+import OrganizationJoinLink from "../components/OrganizationJoinLink";
 import Snackbar from "material-ui/Snackbar";
 import { withRouter } from "react-router";
 import { StyleSheet, css } from "aphrodite";
@@ -134,6 +136,37 @@ class AdminCampaignStats extends React.Component {
     });
   }
 
+  renderErrorCounts() {
+    const { errorCounts } = this.props.data.campaign.stats;
+    const { contactsCount } = this.props.data.campaign;
+    console.log("errorcounts", contactsCount, errorCounts);
+    if (!errorCounts.length) {
+      return null;
+    }
+    return (
+      <div>
+        {errorCounts.map(error => (
+          <div key={error.code}>
+            {error.link ? (
+              <a href={error.link} target="_blank">
+                Error code {error.code}
+              </a>
+            ) : (
+              error.code
+            )}{" "}
+            {error.description || null}
+            <div>{error.count} errors</div>
+            <LinearProgress
+              color="red"
+              mode="determinate"
+              value={Math.round((100 * error.count) / contactsCount)}
+            />
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   renderCopyButton() {
     return (
       <RaisedButton
@@ -147,9 +180,8 @@ class AdminCampaignStats extends React.Component {
 
   render() {
     const { data, params } = this.props;
-    const { organizationId, campaignId } = params;
+    const { adminPerms, organizationId, campaignId } = params;
     const campaign = data.campaign;
-    const { adminPerms } = this.props.params;
     const currentExportJob = this.props.data.campaign.pendingJobs.filter(
       job => job.jobType === "export"
     )[0];
@@ -159,7 +191,11 @@ class AdminCampaignStats extends React.Component {
     const exportLabel = currentExportJob
       ? `Exporting (${currentExportJob.status}%)`
       : "Export Data";
-
+    const {
+      campaignPhoneNumbersEnabled
+    } = this.props.organizationData.organization;
+    const showReleaseNumbers =
+      campaign.isArchived && campaignPhoneNumbersEnabled;
     return (
       <div>
         <div className={css(styles.container)}>
@@ -219,6 +255,7 @@ class AdminCampaignStats extends React.Component {
                         />, // unarchive
                         campaign.isArchived ? (
                           <RaisedButton
+                            disabled={campaign.isArchivedPermanently}
                             onTouchTap={async () =>
                               await this.props.mutations.unarchiveCampaign(
                                 campaignId
@@ -226,7 +263,7 @@ class AdminCampaignStats extends React.Component {
                             }
                             label="Unarchive"
                           />
-                        ) : null, // archive
+                        ) : null,
                         !campaign.isArchived ? (
                           <RaisedButton
                             onTouchTap={async () =>
@@ -256,6 +293,16 @@ class AdminCampaignStats extends React.Component {
                             }
                             label="Messaging Service"
                           />
+                        ) : null,
+                        showReleaseNumbers ? (
+                          <RaisedButton
+                            onTouchTap={async () =>
+                              this.props.mutations.releaseCampaignNumbers(
+                                campaignId
+                              )
+                            }
+                            label="Release Numbers"
+                          />
                         ) : null
                       ]
                     : null}
@@ -264,6 +311,13 @@ class AdminCampaignStats extends React.Component {
             </div>
           </div>
         </div>
+        {campaign.joinToken && campaign.useDynamicAssignment ? (
+          <OrganizationJoinLink
+            organizationUuid={campaign.joinToken}
+            campaignId={campaignId}
+          />
+        ) : null}
+
         <div className={css(styles.container)}>
           <div className={css(styles.flexColumn, styles.spacer)}>
             <Stat title="Contacts" count={campaign.contactsCount} />
@@ -286,7 +340,12 @@ class AdminCampaignStats extends React.Component {
         </div>
         <div className={css(styles.header)}>Survey Questions</div>
         {this.renderSurveyStats()}
-
+        {campaign.stats.errorCounts.length > 0 ? (
+          <div>
+            <div className={css(styles.header)}>Sending Errors</div>
+            {this.renderErrorCounts()}{" "}
+          </div>
+        ) : null}
         <div className={css(styles.header)}>Texter stats</div>
         <div className={css(styles.secondaryHeader)}>% of first texts sent</div>
         <TexterStats campaign={campaign} />
@@ -315,18 +374,24 @@ const queries = {
     query: gql`
       query getCampaign(
         $campaignId: String!
+        $organizationId: String!
         $contactsFilter: ContactsFilter!
+        $assignmentsFilter: AssignmentsFilter
       ) {
         campaign(id: $campaignId) {
           id
           title
           isArchived
+          isArchivedPermanently
+          joinToken
           useDynamicAssignment
           useOwnMessagingService
-          assignments {
+          messageserviceSid
+          assignments(assignmentsFilter: $assignmentsFilter) {
             id
             texter {
               id
+              roles(organizationId: $organizationId)
               firstName
               lastName
             }
@@ -354,6 +419,12 @@ const queries = {
             sentMessagesCount
             receivedMessagesCount
             optOutsCount
+            errorCounts {
+              code
+              count
+              description
+              link
+            }
           }
         }
       }
@@ -361,11 +432,30 @@ const queries = {
     options: ownProps => ({
       variables: {
         campaignId: ownProps.params.campaignId,
+        organizationId: ownProps.params.organizationId,
+        assignmentsFilter: {
+          stats: true
+        },
         contactsFilter: {
           messageStatus: "needsMessage"
         }
       },
       pollInterval: 5000
+    })
+  },
+  organizationData: {
+    query: gql`
+      query getOrganizationData($organizationId: String!) {
+        organization(id: $organizationId) {
+          id
+          campaignPhoneNumbersEnabled
+        }
+      }
+    `,
+    options: ownProps => ({
+      variables: {
+        organizationId: ownProps.params.organizationId
+      }
     })
   }
 };
@@ -412,6 +502,18 @@ const mutations = {
       }
     `,
     variables: { campaignId }
+  }),
+  releaseCampaignNumbers: ownProps => campaignId => ({
+    mutation: gql`
+      mutation releaseCampaignNumbers($campaignId: ID!) {
+        releaseCampaignNumbers(campaignId: $campaignId) {
+          id
+          messageserviceSid
+        }
+      }
+    `,
+    variables: { campaignId },
+    refetchQueries: () => ["getOrganizationData"]
   })
 };
 

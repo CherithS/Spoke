@@ -27,6 +27,11 @@ const campaign = {
     textingHoursEnd: 21
   },
   customFields: [],
+  texterUIConfig: {
+    sideboxChoices: [],
+    options: "{}"
+  },
+  cannedResponses: [],
   interactionSteps: [
     {
       id: 11,
@@ -48,8 +53,6 @@ const propsWithEnforcedTextingHoursCampaign = {
   campaign: campaign,
   assignment: {
     id: 9,
-    userCannedResponses: [],
-    campaignCannedResponses: [],
     texter: {
       id: 2,
       firstName: "larry",

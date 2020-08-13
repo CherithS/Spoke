@@ -2,8 +2,6 @@ import thinky from "./thinky";
 const type = thinky.type;
 import { requiredString, optionalString, timestamp } from "./custom-types";
 
-import Organization from "./organization";
-
 const Campaign = thinky.createModel(
   "campaign",
   type
@@ -17,6 +15,10 @@ const Campaign = thinky.createModel(
         .foreign("user"),
       title: optionalString(),
       description: optionalString(),
+      join_token: optionalString().allowNull(true),
+      batch_size: type.integer().allowNull(true),
+      response_window: type.number().allowNull(true),
+      features: type.string().allowNull(true),
       is_started: type.boolean().required(),
       due_by: type
         .date()
@@ -63,5 +65,6 @@ const Campaign = thinky.createModel(
 
 Campaign.ensureIndex("organization_id");
 Campaign.ensureIndex("creator_id");
+Campaign.ensureIndex("join_token");
 
 export default Campaign;

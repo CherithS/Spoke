@@ -6,6 +6,7 @@ import GSForm from "./forms/GSForm";
 import Form from "react-formal";
 import FlatButton from "material-ui/FlatButton";
 import { dataTest } from "../lib/attributes";
+import theme from "../styles/theme";
 
 const styles = StyleSheet.create({
   buttonRow: {
@@ -26,10 +27,20 @@ class CannedResponseForm extends React.Component {
       text: yup.string().required()
     });
 
-    const { customFields, handleCloseAddForm } = this.props;
+    const {
+      customFields,
+      handleCloseAddForm,
+      formButtonText,
+      defaultValue
+    } = this.props;
     return (
       <div>
-        <GSForm ref="form" schema={modelSchema} onSubmit={this.handleSave}>
+        <GSForm
+          ref="form"
+          schema={modelSchema}
+          onSubmit={this.handleSave}
+          defaultValue={defaultValue}
+        >
           <Form.Field
             {...dataTest("title")}
             name="title"
@@ -47,12 +58,16 @@ class CannedResponseForm extends React.Component {
             fullWidth
           />
           <div className={css(styles.buttonRow)}>
-            <Form.Button
+            <FlatButton
               {...dataTest("addResponse")}
-              type="submit"
-              label="Add Response"
+              label={formButtonText}
+              backgroundColor={theme.colors.green}
+              labelStyle={{ color: "white" }}
               style={{
                 display: "inline-block"
+              }}
+              onClick={() => {
+                this.refs.form.submit();
               }}
             />
             <FlatButton
@@ -73,7 +88,9 @@ class CannedResponseForm extends React.Component {
 CannedResponseForm.propTypes = {
   onSaveCannedResponse: type.func,
   handleCloseAddForm: type.func,
-  customFields: type.array
+  customFields: type.array,
+  formButtonText: type.string,
+  defaultValue: type.object
 };
 
 export default CannedResponseForm;

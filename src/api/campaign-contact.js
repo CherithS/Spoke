@@ -4,6 +4,8 @@ export const schema = `
     isOptedOut: Boolean
     validTimezone: Boolean
     includePastDue: Boolean
+    tags: [String]
+    contactId: String
   }
 
   type Timezone {
@@ -26,6 +28,7 @@ export const schema = `
     external_id: String
     customFields: JSON
     messages: [Message]
+    tags: [ContactTag]
     location: Location
     optOut: OptOut
     campaign: Campaign

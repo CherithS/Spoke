@@ -1,10 +1,10 @@
 import { GraphQLError } from "graphql/error";
 
-import { log } from "../../../lib";
-import { Message, r, cacheableData } from "../../models";
-import serviceMap from "../lib/services";
+import { Message, cacheableData } from "../../models";
 
 import { getSendBeforeTimeUtc } from "../../../lib/timezones";
+import { jobRunner } from "../../../extensions/job-runners";
+import { Tasks } from "../../../workers/tasks";
 
 const JOBS_SAME_PROCESS = !!(
   process.env.JOBS_SAME_PROCESS || global.JOBS_SAME_PROCESS
@@ -13,10 +13,11 @@ const JOBS_SAME_PROCESS = !!(
 export const sendMessage = async (
   _,
   { message, campaignContactId },
-  { loaders, user }
+  { user }
 ) => {
-  let contact = await loaders.campaignContact.load(campaignContactId);
-  const campaign = await loaders.campaign.load(contact.campaign_id);
+  // contact is mutated, so we don't use a loader
+  let contact = await cacheableData.campaignContact.load(campaignContactId);
+  const campaign = await cacheableData.campaign.load(contact.campaign_id);
   if (
     contact.assignment_id !== parseInt(message.assignmentId) ||
     campaign.is_archived
@@ -27,7 +28,7 @@ export const sendMessage = async (
       message: "Your assignment has changed"
     });
   }
-  const organization = await loaders.organization.load(
+  const organization = await cacheableData.organization.load(
     campaign.organization_id
   );
   const orgFeatures = JSON.parse(organization.features || "{}");
@@ -108,7 +109,7 @@ export const sendMessage = async (
     global.DEFAULT_SERVICE ||
     process.env.DEFAULT_SERVICE ||
     "";
-  const service = serviceMap[serviceName];
+
   const finalText = replaceCurlyApostrophes(text);
   const messageInstance = new Message({
     text: finalText,
@@ -128,21 +129,28 @@ export const sendMessage = async (
 
   const saveResult = await cacheableData.message.save({
     messageInstance,
-    contact
+    contact,
+    campaign,
+    organization,
+    texter: user
   });
+  if (!saveResult.message) {
+    throw new GraphQLError(
+      `Message send error ${saveResult.texterError || ""}`
+    );
+  }
   contact.message_status = saveResult.contactStatus;
 
-  // log.info(
-  //   `Sending (${serviceName}): ${messageInstance.user_number} -> ${messageInstance.contact_number}\nMessage: ${messageInstance.text}`
-  // );
-  //NO AWAIT: pro=return before api completes, con=context needs to stay alive
-  service.sendMessage(
-    saveResult.message,
-    contact,
-    null,
-    organization,
-    campaign
-  );
+  if (!saveResult.blockSend) {
+    await jobRunner.dispatchTask(Tasks.SEND_MESSAGE, {
+      message: saveResult.message,
+      contact,
+      // TODO: start a transaction inside the service send message function
+      trx: null,
+      organization,
+      campaign
+    });
+  }
 
   if (initialMessageStatus === "needsMessage") {
     // don't both requerying the messages list on the response

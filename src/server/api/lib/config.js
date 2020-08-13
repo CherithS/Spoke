@@ -8,15 +8,33 @@ import fs from "fs";
 
 let CONFIG = null;
 
+export function getFeatures(organization) {
+  if (!organization) {
+    return {};
+  }
+  return (
+    organization.feature ||
+    (organization.features &&
+      typeof organization.features == "string" &&
+      JSON.parse(organization.features)) ||
+    organization.features ||
+    {}
+  );
+}
+
+export const getOrDefault = (value, defaultValue) =>
+  value === "" ? defaultValue : value;
+
 export function getConfig(key, organization, opts) {
   if (organization) {
-    let features =
-      organization.feature ||
-      (organization.features && JSON.parse(organization.features)) ||
-      {};
-    if (features[key]) {
-      return features[key];
+    // TODO: update to not parse if features is an object (vs. a string)
+    let features = getFeatures(organization);
+    if (features.hasOwnProperty(key)) {
+      return getOrDefault(features[key], opts && opts.default);
     }
+  }
+  if (opts && opts.onlyLocal) {
+    return opts.default;
   }
   if (key in global) {
     if (opts && opts.truthy) {
@@ -24,7 +42,7 @@ export function getConfig(key, organization, opts) {
         global[key] && global[key] !== "0" && global[key] !== "false"
       );
     }
-    return global[key];
+    return getOrDefault(global[key], opts && opts.default);
   } else if (key in process.env) {
     if (opts && opts.truthy) {
       return Boolean(
@@ -33,12 +51,13 @@ export function getConfig(key, organization, opts) {
           process.env[key] !== "false"
       );
     }
-    return process.env[key];
+    return getOrDefault(process.env[key], opts && opts.default);
   } else if (CONFIG && key in CONFIG) {
-    return CONFIG[key];
+    return getOrDefault(CONFIG[key], opts && opts.default);
   } else if (opts && opts.truthy) {
     return false;
   }
+  return opts && opts.default;
 }
 
 export function hasConfig(key, organization) {

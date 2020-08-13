@@ -23,24 +23,17 @@ class JoinTeam extends React.Component {
       organization = await this.props.mutations.joinOrganization(
         this.props.location.search
       );
-    } catch (ex) {
+    } catch (err) {
+      console.log("error joining", err);
+      const texterMessage = (err &&
+        err.message &&
+        err.message.match(/(Sorry,.+)$/)) || [
+        0,
+        "Something went wrong trying to join this organization. Please contact your administrator."
+      ];
       this.setState({
-        errors:
-          "Something went wrong trying to join this organization. Please contact your administrator."
+        errors: texterMessage[1]
       });
-    }
-
-    if (this.props.params.campaignId) {
-      try {
-        campaign = await this.props.mutations.assignUserToCampaign(
-          this.props.location.search
-        );
-      } catch (ex) {
-        this.setState({
-          errors:
-            "Something went wrong trying to join this campaign. Please contact your administrator."
-        });
-      }
     }
 
     if (organization) {
@@ -71,29 +64,10 @@ const mutations = {
     mutation: gql`
       mutation joinOrganization(
         $organizationUuid: String!
+        $campaignId: String
         $queryParams: String
       ) {
         joinOrganization(
-          organizationUuid: $organizationUuid
-          queryParams: $queryParams
-        ) {
-          id
-        }
-      }
-    `,
-    variables: {
-      organizationUuid: ownProps.params.organizationUuid,
-      queryParams: queryParams
-    }
-  }),
-  assignUserToCampaign: ownProps => queryParams => ({
-    mutation: gql`
-      mutation assignUserToCampaign(
-        $organizationUuid: String!
-        $campaignId: String!
-        $queryParams: String
-      ) {
-        assignUserToCampaign(
           organizationUuid: $organizationUuid
           campaignId: $campaignId
           queryParams: $queryParams
@@ -103,8 +77,8 @@ const mutations = {
       }
     `,
     variables: {
-      campaignId: ownProps.params.campaignId,
       organizationUuid: ownProps.params.organizationUuid,
+      campaignId: ownProps.params.campaignId,
       queryParams: queryParams
     }
   })
